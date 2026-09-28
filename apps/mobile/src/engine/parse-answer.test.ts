@@ -25,6 +25,19 @@ describe("parseAnswer", () => {
     expect(parseAnswer("20 no 21")).toEqual({ kind: "answer", value: 21 });
     expect(parseAnswer("200, sorry, 20")).toEqual({ kind: "answer", value: 20 });
     expect(parseAnswer("twenty no twenty one")).toEqual({ kind: "answer", value: 21 });
+    expect(parseAnswer("10 oh no 13")).toEqual({ kind: "answer", value: 13 });
+    expect(parseAnswer("50 oops 60")).toEqual({ kind: "answer", value: 60 });
+    expect(parseAnswer("31 oh wait let me think 14")).toEqual({
+      kind: "answer",
+      value: 14,
+    });
+  });
+
+  it("extracts final asserted answer from thinking aloud", () => {
+    expect(parseAnswer("40 plus 20 mmm 60, 60 plus 3 is 63")).toEqual({
+      kind: "answer",
+      value: 63,
+    });
   });
 
   it("treats skip and pass as skip", () => {

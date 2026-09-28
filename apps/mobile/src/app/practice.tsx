@@ -309,7 +309,13 @@ function VoicePracticeRound({
               Voice needs a development build with microphone permission. Use Typed mode
               from Setup if this keeps failing.
             </Text>
-          ) : null}
+          ) : (
+            <Text style={styles.hint}>
+              Speak anytime — you can answer while the question is still being read. Live
+              text appears above. Tap Listen again if it stops. Set EXPO_PUBLIC_DEEPGRAM_API_KEY
+              in apps/mobile/.env for cloud STT.
+            </Text>
+          )}
         </View>
       }
     >

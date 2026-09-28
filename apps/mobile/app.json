@@ -33,6 +33,7 @@
       "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
+      "expo-audio",
       "expo-router",
       [
         "expo-splash-screen",
@@ -48,7 +49,9 @@
           "microphonePermission": "Allow Project Quant to use the microphone for voice answers.",
           "speechRecognitionPermission": "Allow Project Quant to hear your spoken answers.",
           "androidSpeechServicePackages": [
-            "com.google.android.googlequicksearchbox"
+            "com.google.android.googlequicksearchbox",
+            "com.google.android.tts",
+            "com.google.android.as"
           ]
         }
       ]

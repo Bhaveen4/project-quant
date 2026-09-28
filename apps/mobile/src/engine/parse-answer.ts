@@ -7,7 +7,6 @@ export type ParseResult =
 
 const ONES: Record<string, number> = {
   zero: 0,
-  oh: 0,
   one: 1,
   two: 2,
   three: 3,
@@ -51,28 +50,65 @@ const UNKNOWN_PHRASES = [
   "idk",
 ];
 
-const CORRECTION_CUES = [
+const FILLER_PHRASES = [
+  "let me think",
+  "give me a second",
+  "hang on",
+  "one sec",
+  "umm",
+  "ummm",
+  "uh",
+  "uhh",
+  "er",
+  "mmm",
+  "mm",
+  "like",
+];
+
+const MULTI_WORD_CUES: string[][] = [
+  ["oh", "no"],
+  ["oh", "wait"],
+  ["i", "mean"],
+];
+
+const SINGLE_CUE_TOKENS = new Set([
   "no",
   "nope",
   "sorry",
   "wait",
   "actually",
-  "i mean",
   "correction",
-];
+  "oops",
+]);
+
+const ASSERTION_RE =
+  /\b(?:is|equals|equal to|thats|that's|so|makes)\s+(.+)$/i;
 
 function normalize(raw: string): string {
-  return raw
+  let text = raw
     .toLowerCase()
     .replace(/['’]/g, "")
-    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/[^a-z0-9\s+\-]/g, " ")
     .replace(/-/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+
+  for (const phrase of FILLER_PHRASES) {
+    text = text.replace(new RegExp(`\\b${phrase}\\b`, "g"), " ");
+  }
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function tokensOf(text: string): string[] {
   return text.split(" ").filter(Boolean);
+}
+
+function isOhInterjection(tokens: string[], index: number): boolean {
+  if (tokens[index] !== "oh") {
+    return false;
+  }
+  const next = tokens[index + 1];
+  return next === "no" || next === "wait";
 }
 
 /** Parse a sequence of English number words / digits into an integer, or null. */
@@ -82,7 +118,6 @@ export function parseNumberPhrase(phrase: string): number | null {
     return null;
   }
 
-  // Pure digit string (possibly with spaces already stripped by normalize)
   if (tokens.every((t) => /^\d+$/.test(t))) {
     const joined = tokens.join("");
     if (joined.length > 6) {
@@ -95,7 +130,16 @@ export function parseNumberPhrase(phrase: string): number | null {
   let current = 0;
   let sawNumber = false;
 
-  for (const token of tokens) {
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token === "oh" && isOhInterjection(tokens, i)) {
+      return null;
+    }
+    if (token === "oh") {
+      current += 0;
+      sawNumber = true;
+      continue;
+    }
     if (/^\d+$/.test(token)) {
       current += Number.parseInt(token, 10);
       sawNumber = true;
@@ -123,7 +167,7 @@ export function parseNumberPhrase(phrase: string): number | null {
       sawNumber = true;
       continue;
     }
-    if (token === "and") {
+    if (token === "and" || token === "plus") {
       continue;
     }
     return null;
@@ -146,14 +190,21 @@ function extractNumberSpans(tokens: string[]): string[] {
     }
   };
 
-  for (const token of tokens) {
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token === "oh" && isOhInterjection(tokens, i)) {
+      flush();
+      continue;
+    }
     const isNum =
       /^\d+$/.test(token) ||
       token in ONES ||
       token in TENS ||
       token === "hundred" ||
       token === "thousand" ||
-      token === "and";
+      token === "and" ||
+      token === "plus" ||
+      token === "oh";
     if (isNum) {
       buf.push(token);
     } else {
@@ -164,8 +215,32 @@ function extractNumberSpans(tokens: string[]): string[] {
   return spans;
 }
 
-function isCue(token: string): boolean {
-  return CORRECTION_CUES.includes(token);
+function lastCorrectionIndex(tokens: string[]): number {
+  let last = -1;
+  for (let i = 0; i < tokens.length; i += 1) {
+    for (const cue of MULTI_WORD_CUES) {
+      if (
+        cue.length === 2 &&
+        tokens[i] === cue[0] &&
+        tokens[i + 1] === cue[1]
+      ) {
+        last = i + 1;
+        i += 1;
+      }
+    }
+    if (SINGLE_CUE_TOKENS.has(tokens[i])) {
+      last = i;
+    }
+  }
+  return last;
+}
+
+function assertedAnswerPhrase(normalized: string): string | null {
+  const match = normalized.match(ASSERTION_RE);
+  if (!match?.[1]) {
+    return null;
+  }
+  return match[1].trim();
 }
 
 /**
@@ -186,7 +261,6 @@ export function parseAnswer(transcript: string): ParseResult {
     return { kind: "unknown" };
   }
 
-  // "10 or 20", "fifteen or sixteen"
   if (/\bor\b/.test(normalized)) {
     const parts = normalized.split(/\bor\b/).map((p) => p.trim());
     const nums = parts
@@ -197,22 +271,22 @@ export function parseAnswer(transcript: string): ParseResult {
     }
   }
 
-  const tokens = tokensOf(normalized);
-
-  // Correction: take the number after the last correction cue when present.
-  let lastCue = -1;
-  for (let i = 0; i < tokens.length; i += 1) {
-    if (isCue(tokens[i])) {
-      lastCue = i;
+  const asserted = assertedAnswerPhrase(normalized);
+  if (asserted) {
+    const value = parseNumberPhrase(asserted);
+    if (value != null) {
+      return { kind: "answer", value };
     }
   }
+
+  const tokens = tokensOf(normalized);
+  const lastCue = lastCorrectionIndex(tokens);
   if (lastCue >= 0) {
     const after = tokens.slice(lastCue + 1).join(" ");
     const value = parseNumberPhrase(after);
     if (value != null) {
       return { kind: "answer", value };
     }
-    // "no" alone etc. — fall through
   }
 
   const spans = extractNumberSpans(tokens);
@@ -220,8 +294,6 @@ export function parseAnswer(transcript: string): ParseResult {
     return { kind: "unparsed" };
   }
 
-  // Multiple number spans without a correction cue → prefer the last spoken number
-  // ("umm twenty one" has one span; "200 sorry 20" is handled via cue above).
   const value = parseNumberPhrase(spans[spans.length - 1]);
   if (value == null) {
     return { kind: "unparsed" };

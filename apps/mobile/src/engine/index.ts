@@ -4,6 +4,12 @@ export { formatAddends, speakAddends, speakNumber } from "./speak-number";
 export { parseAnswer, parseNumberPhrase } from "./parse-answer";
 export type { ParseResult } from "./parse-answer";
 export {
+  interpretAnswerDeterministic,
+  isConfidentInterim,
+  needsLlmFallback,
+} from "./interpret-answer";
+export type { InterpretConfidence, InterpretResult } from "./interpret-answer";
+export {
   commitAnswer,
   createSession,
   currentQuestion,
