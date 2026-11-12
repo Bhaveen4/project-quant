@@ -5,8 +5,7 @@ export type ParseResult =
   | { kind: "ambiguous" }
   | { kind: "unparsed" };
 
-const ONES: Record<string, number> = {
-  zero: 0,
+const UNITS: Record<string, number> = {
   one: 1,
   two: 2,
   three: 3,
@@ -16,6 +15,9 @@ const ONES: Record<string, number> = {
   seven: 7,
   eight: 8,
   nine: 9,
+};
+
+const TEENS: Record<string, number> = {
   ten: 10,
   eleven: 11,
   twelve: 12,
@@ -39,7 +41,17 @@ const TENS: Record<string, number> = {
   ninety: 90,
 };
 
-const SKIP_PHRASES = ["skip", "next", "pass"];
+/** Speech-to-text sometimes returns a homophone when a single number is said alone. */
+const LONE_HOMOPHONES: Record<string, number> = {
+  won: 1,
+  to: 2,
+  too: 2,
+  for: 4,
+  ate: 8,
+};
+
+const SKIP_WORDS = new Set(["skip", "next", "pass"]);
+
 const UNKNOWN_PHRASES = [
   "i dont know",
   "i do not know",
@@ -53,43 +65,41 @@ const UNKNOWN_PHRASES = [
 const FILLER_PHRASES = [
   "let me think",
   "give me a second",
-  "hang on",
+  "give me a sec",
+  "one second",
   "one sec",
+  "one moment",
+  "hang on",
+  "um",
   "umm",
   "ummm",
   "uh",
   "uhh",
+  "uhm",
+  "erm",
   "er",
+  "ah",
+  "oh",
+  "hmm",
   "mmm",
   "mm",
   "like",
 ];
 
-const MULTI_WORD_CUES: string[][] = [
-  ["oh", "no"],
-  ["oh", "wait"],
-  ["i", "mean"],
-];
+/** Words that join two numbers into an expression, so neither side is the answer. */
+const OPERATORS = new Set(["plus", "minus", "times"]);
 
-const SINGLE_CUE_TOKENS = new Set([
-  "no",
-  "nope",
-  "sorry",
-  "wait",
-  "actually",
-  "correction",
-  "oops",
-]);
-
-const ASSERTION_RE =
-  /\b(?:is|equals|equal to|thats|that's|so|makes)\s+(.+)$/i;
+const MAX_DIGITS = 6;
 
 function normalize(raw: string): string {
   let text = raw
     .toLowerCase()
     .replace(/['’]/g, "")
-    .replace(/[^a-z0-9\s+\-]/g, " ")
-    .replace(/-/g, " ")
+    // Thousands separators: "1,234" -> "1234".
+    .replace(/(\d),(?=\d{3}(?!\d))/g, "$1")
+    .replace(/\+/g, " plus ")
+    .replace(/=/g, " equals ")
+    .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -103,200 +113,299 @@ function tokensOf(text: string): string[] {
   return text.split(" ").filter(Boolean);
 }
 
-function isOhInterjection(tokens: string[], index: number): boolean {
-  if (tokens[index] !== "oh") {
-    return false;
-  }
-  const next = tokens[index + 1];
-  return next === "no" || next === "wait";
+function isDigits(token: string): boolean {
+  return /^\d+$/.test(token) && token.length <= MAX_DIGITS;
 }
 
-/** Parse a sequence of English number words / digits into an integer, or null. */
+function startsBelowHundred(token: string | undefined): boolean {
+  if (token === undefined) {
+    return false;
+  }
+  if (token in UNITS || token in TEENS || token in TENS) {
+    return true;
+  }
+  return isDigits(token) && Number.parseInt(token, 10) < 100;
+}
+
+type NumberPart = "units" | "teen" | "tens" | "hundred" | "thousand" | "digits";
+
+/**
+ * What a digit string can combine with, like its spoken form: speech-to-text
+ * may return "twenty … one" as "20 one", or "one hundred … twenty three" as "100 23".
+ */
+function digitsPart(value: number): NumberPart {
+  if (value >= 1000 && value % 1000 === 0) {
+    return "thousand";
+  }
+  if (value >= 100 && value % 100 === 0) {
+    return "hundred";
+  }
+  const rest = value % 100;
+  if (rest >= 20 && rest % 10 === 0) {
+    return "tens";
+  }
+  if (rest >= 10) {
+    return rest <= 19 ? "teen" : "digits";
+  }
+  return rest >= 1 ? "units" : "digits";
+}
+
+type NumberSpan = {
+  start: number;
+  /** Exclusive. */
+  end: number;
+  value: number;
+};
+
+/**
+ * Reads one English number starting at `start`, following real number grammar
+ * so that "twenty one" is 21 but "eight fifteen" is two numbers (8, 15).
+ */
+function readNumber(tokens: string[], start: number): NumberSpan | null {
+  let total = 0;
+  let chunk = 0;
+  let last: NumberPart | null = null;
+  let i = start;
+
+  while (i < tokens.length) {
+    const token = tokens[i];
+    const next = tokens[i + 1];
+
+    if (last === null && token === "a" && (next === "hundred" || next === "thousand")) {
+      chunk = 1;
+      last = "units";
+      i += 1;
+      continue;
+    }
+
+    if (token === "and") {
+      // "one hundred and five": a connector only after a scale word.
+      if ((last === "hundred" || last === "thousand") && startsBelowHundred(next)) {
+        i += 1;
+        continue;
+      }
+      break;
+    }
+
+    if (token === "zero") {
+      if (last === null) {
+        return { start, end: i + 1, value: 0 };
+      }
+      break;
+    }
+
+    if (token in UNITS) {
+      if (last === null || last === "tens" || last === "hundred" || last === "thousand") {
+        chunk += UNITS[token];
+        last = "units";
+        i += 1;
+        continue;
+      }
+      break;
+    }
+
+    if (token in TEENS || token in TENS) {
+      if (last === null || last === "hundred" || last === "thousand") {
+        chunk += token in TEENS ? TEENS[token] : TENS[token];
+        last = token in TEENS ? "teen" : "tens";
+        i += 1;
+        continue;
+      }
+      break;
+    }
+
+    if (token === "hundred") {
+      const canScale =
+        last === null || last === "units" || last === "teen" || last === "digits";
+      if (canScale && chunk < 100) {
+        chunk = (chunk === 0 ? 1 : chunk) * 100;
+        last = "hundred";
+        i += 1;
+        continue;
+      }
+      break;
+    }
+
+    if (token === "thousand") {
+      if (total === 0 && last !== "thousand" && chunk < 1000) {
+        total = (chunk === 0 ? 1 : chunk) * 1000;
+        chunk = 0;
+        last = "thousand";
+        i += 1;
+        continue;
+      }
+      break;
+    }
+
+    if (isDigits(token)) {
+      const value = Number.parseInt(token, 10);
+      const fits =
+        last === null ||
+        (last === "hundred" && value < 100) ||
+        (last === "thousand" && value < 1000) ||
+        (last === "tens" && value >= 1 && value <= 9);
+      if (!fits) {
+        break;
+      }
+      const part = digitsPart(value);
+      if (part === "thousand") {
+        total = value;
+      } else {
+        chunk += value;
+      }
+      last = part;
+      i += 1;
+      continue;
+    }
+
+    break;
+  }
+
+  if (last === null) {
+    return null;
+  }
+  return { start, end: i, value: total + chunk };
+}
+
+function findNumberSpans(tokens: string[]): NumberSpan[] {
+  const spans: NumberSpan[] = [];
+  let i = 0;
+  while (i < tokens.length) {
+    const span = readNumber(tokens, i);
+    if (span) {
+      spans.push(span);
+      i = span.end;
+    } else {
+      i += 1;
+    }
+  }
+  return spans;
+}
+
+/**
+ * A number that is part of an arithmetic expression ("seven plus eight",
+ * "40 and 20") is the user thinking aloud or the question prompt leaking into
+ * the mic, not their answer.
+ */
+function isOperand(span: NumberSpan, spans: NumberSpan[], tokens: string[]): boolean {
+  const before = tokens[span.start - 1];
+  const after = tokens[span.end];
+  if ((before && OPERATORS.has(before)) || (after && OPERATORS.has(after))) {
+    return true;
+  }
+  const joinedBefore =
+    before === "and" && spans.some((other) => other.end === span.start - 1);
+  const joinedAfter =
+    after === "and" && spans.some((other) => other.start === span.end + 1);
+  return joinedBefore || joinedAfter;
+}
+
+type Analysis = {
+  tokens: string[];
+  candidate: NumberSpan | null;
+  ambiguous: boolean;
+};
+
+function analyze(transcript: string): Analysis {
+  const tokens = tokensOf(normalize(transcript));
+
+  if (tokens.length === 1 && tokens[0] in LONE_HOMOPHONES) {
+    return {
+      tokens,
+      candidate: { start: 0, end: 1, value: LONE_HOMOPHONES[tokens[0]] },
+      ambiguous: false,
+    };
+  }
+
+  const spans = findNumberSpans(tokens);
+  const candidates = spans.filter(
+    (span) => tokens[span.start - 1] !== "not" && !isOperand(span, spans, tokens),
+  );
+  const candidate = candidates[candidates.length - 1] ?? null;
+
+  // "fifteen or sixteen" with no later choice.
+  const ambiguous =
+    candidate != null &&
+    tokens[candidate.start - 1] === "or" &&
+    spans.some((other) => other.end === candidate.start - 1);
+
+  return { tokens, candidate, ambiguous };
+}
+
+/** Parse a phrase that should be exactly one number ("twenty one", "434"), or null. */
 export function parseNumberPhrase(phrase: string): number | null {
   const tokens = tokensOf(normalize(phrase));
   if (tokens.length === 0) {
     return null;
   }
-
-  if (tokens.every((t) => /^\d+$/.test(t))) {
-    const joined = tokens.join("");
-    if (joined.length > 6) {
-      return null;
-    }
-    return Number.parseInt(joined, 10);
-  }
-
-  let total = 0;
-  let current = 0;
-  let sawNumber = false;
-
-  for (let i = 0; i < tokens.length; i += 1) {
-    const token = tokens[i];
-    if (token === "oh" && isOhInterjection(tokens, i)) {
-      return null;
-    }
-    if (token === "oh") {
-      current += 0;
-      sawNumber = true;
-      continue;
-    }
-    if (/^\d+$/.test(token)) {
-      current += Number.parseInt(token, 10);
-      sawNumber = true;
-      continue;
-    }
-    if (token in ONES) {
-      current += ONES[token];
-      sawNumber = true;
-      continue;
-    }
-    if (token in TENS) {
-      current += TENS[token];
-      sawNumber = true;
-      continue;
-    }
-    if (token === "hundred") {
-      current = (current === 0 ? 1 : current) * 100;
-      sawNumber = true;
-      continue;
-    }
-    if (token === "thousand") {
-      current = (current === 0 ? 1 : current) * 1000;
-      total += current;
-      current = 0;
-      sawNumber = true;
-      continue;
-    }
-    if (token === "and" || token === "plus") {
-      continue;
-    }
-    return null;
-  }
-
-  if (!sawNumber) {
-    return null;
-  }
-  return total + current;
-}
-
-function extractNumberSpans(tokens: string[]): string[] {
-  const spans: string[] = [];
-  let buf: string[] = [];
-
-  const flush = () => {
-    if (buf.length > 0) {
-      spans.push(buf.join(" "));
-      buf = [];
-    }
-  };
-
-  for (let i = 0; i < tokens.length; i += 1) {
-    const token = tokens[i];
-    if (token === "oh" && isOhInterjection(tokens, i)) {
-      flush();
-      continue;
-    }
-    const isNum =
-      /^\d+$/.test(token) ||
-      token in ONES ||
-      token in TENS ||
-      token === "hundred" ||
-      token === "thousand" ||
-      token === "and" ||
-      token === "plus" ||
-      token === "oh";
-    if (isNum) {
-      buf.push(token);
-    } else {
-      flush();
-    }
-  }
-  flush();
-  return spans;
-}
-
-function lastCorrectionIndex(tokens: string[]): number {
-  let last = -1;
-  for (let i = 0; i < tokens.length; i += 1) {
-    for (const cue of MULTI_WORD_CUES) {
-      if (
-        cue.length === 2 &&
-        tokens[i] === cue[0] &&
-        tokens[i + 1] === cue[1]
-      ) {
-        last = i + 1;
-        i += 1;
-      }
-    }
-    if (SINGLE_CUE_TOKENS.has(tokens[i])) {
-      last = i;
-    }
-  }
-  return last;
-}
-
-function assertedAnswerPhrase(normalized: string): string | null {
-  const match = normalized.match(ASSERTION_RE);
-  if (!match?.[1]) {
-    return null;
-  }
-  return match[1].trim();
+  const span = readNumber(tokens, 0);
+  return span && span.end === tokens.length ? span.value : null;
 }
 
 /**
- * Interpret a speech transcript into an answer intent.
- * Deterministic only — no LLM.
+ * Interpret a speech transcript into an answer intent. Deterministic — the
+ * spoken words decide the answer; nothing here knows the correct result.
  */
 export function parseAnswer(transcript: string): ParseResult {
-  const normalized = normalize(transcript);
-  if (!normalized) {
+  const { tokens, candidate, ambiguous } = analyze(transcript);
+  if (tokens.length === 0) {
     return { kind: "unparsed" };
   }
 
-  if (SKIP_PHRASES.some((p) => normalized === p || normalized.startsWith(`${p} `))) {
+  if (SKIP_WORDS.has(tokens[0])) {
     return { kind: "skip" };
   }
 
-  if (UNKNOWN_PHRASES.some((p) => normalized.includes(p))) {
+  let lastSkip = -1;
+  tokens.forEach((token, index) => {
+    if (SKIP_WORDS.has(token)) {
+      lastSkip = index;
+    }
+  });
+
+  if (candidate) {
+    if (lastSkip >= candidate.end) {
+      return { kind: "skip" };
+    }
+    if (ambiguous) {
+      return { kind: "ambiguous" };
+    }
+    return { kind: "answer", value: candidate.value };
+  }
+
+  if (lastSkip >= 0) {
+    return { kind: "skip" };
+  }
+
+  const text = tokens.join(" ");
+  if (UNKNOWN_PHRASES.some((phrase) => new RegExp(`\\b${phrase}\\b`).test(text))) {
     return { kind: "unknown" };
   }
 
-  if (/\bor\b/.test(normalized)) {
-    const parts = normalized.split(/\bor\b/).map((p) => p.trim());
-    const nums = parts
-      .map((p) => parseNumberPhrase(p))
-      .filter((n): n is number => n != null);
-    if (nums.length >= 2) {
-      return { kind: "ambiguous" };
-    }
-  }
+  return { kind: "unparsed" };
+}
 
-  const asserted = assertedAnswerPhrase(normalized);
-  if (asserted) {
-    const value = parseNumberPhrase(asserted);
-    if (value != null) {
-      return { kind: "answer", value };
-    }
+/**
+ * True when the answer in the transcript may not be finished yet: the number
+ * could still grow ("twenty…", "one hundred…") or words follow it, which is
+ * how corrections start ("fifty, oops…") even when the cue word is misheard.
+ */
+export function endsMidAnswer(transcript: string): boolean {
+  const { tokens, candidate } = analyze(transcript);
+  if (!candidate) {
+    return false;
   }
-
-  const tokens = tokensOf(normalized);
-  const lastCue = lastCorrectionIndex(tokens);
-  if (lastCue >= 0) {
-    const after = tokens.slice(lastCue + 1).join(" ");
-    const value = parseNumberPhrase(after);
-    if (value != null) {
-      return { kind: "answer", value };
-    }
+  if (candidate.end < tokens.length) {
+    return true;
   }
-
-  const spans = extractNumberSpans(tokens);
-  if (spans.length === 0) {
-    return { kind: "unparsed" };
+  const last = tokens[candidate.end - 1];
+  if (last in TENS || last === "hundred" || last === "thousand") {
+    return true;
   }
-
-  const value = parseNumberPhrase(spans[spans.length - 1]);
-  if (value == null) {
-    return { kind: "unparsed" };
+  if (isDigits(last)) {
+    const value = Number.parseInt(last, 10);
+    // 20, 30, 100, 120, 2000… can still grow; 10, 110, 15, 21 cannot.
+    return value >= 20 && value % 10 === 0 && value % 100 !== 10;
   }
-  return { kind: "answer", value };
+  return false;
 }

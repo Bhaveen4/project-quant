@@ -1,23 +1,21 @@
+import { requestRecordingPermissionsAsync, useAudioStream, type AudioStreamBuffer } from "expo-audio";
 import * as Speech from "expo-speech";
-import {
-  ExpoSpeechRecognitionModule,
-  RecognizerIntentExtraLanguageModel,
-  useSpeechRecognitionEvent,
-} from "expo-speech-recognition";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Platform } from "react-native";
 
-import {
-  interpretAnswerDeterministic,
-  isConfidentInterim,
-  needsLlmFallback,
-} from "@/engine/interpret-answer";
-import type { ParseResult } from "@/engine/parse-answer";
+import { createAnswerListener, type AnswerListener } from "./answer-listener";
+import { openGeminiTranscriber } from "./gemini-transcriber";
+import { getGeminiApiKey } from "./voice-config";
 
-import { createDeepgramLiveSession } from "./deepgram-live-stt";
-import { createMicPcmStream } from "./deepgram-mic";
-import { interpretAnswerWithLlm } from "./llm-intent";
-import { getDeepgramApiKey, getOpenAiApiKey } from "./voice-config";
+const MISSING_KEY_MESSAGE = "Set EXPO_PUBLIC_GEMINI_API_KEY in .env";
+const SAMPLE_RATE = 16000;
+
+/**
+ * Upper bound for reading a prompt aloud. If the speech engine never reports
+ * that it finished, the mic opens after this instead of the round hanging.
+ */
+function promptTimeoutMs(spoken: string): number {
+  return spoken.split(/[\s-]+/).length * 600 + 4000;
+}
 
 export type VoicePhase =
   | "asking"
@@ -44,69 +42,53 @@ type UseVoiceRoundResult = {
   stopAll: () => void;
 };
 
-const SETTLE_MS = 450;
+type RoundState = {
+  key: string;
+  phase: VoicePhase;
+  transcript: string;
+  statusText: string;
+};
 
-function stopDeviceRecognition() {
-  try {
-    ExpoSpeechRecognitionModule.abort();
-  } catch {
-    // ignore
-  }
+function freshRound(key: string, hasApiKey: boolean): RoundState {
+  return hasApiKey
+    ? { key, phase: "asking", transcript: "", statusText: "Speaking…" }
+    : { key, phase: "unavailable", transcript: "", statusText: MISSING_KEY_MESSAGE };
 }
 
-function buildDeviceStartOptions() {
-  return {
-    lang: "en-US",
-    interimResults: true,
-    continuous: true,
-    requiresOnDeviceRecognition: false,
-    iosTaskHint: "confirmation" as const,
-    iosVoiceProcessingEnabled: Platform.OS === "ios",
-    contextualStrings: ["skip", "next", "pass", "sorry"],
-    ...(Platform.OS === "android"
-      ? {
-          androidIntentOptions: {
-            EXTRA_LANGUAGE_MODEL:
-              RecognizerIntentExtraLanguageModel.LANGUAGE_MODEL_WEB_SEARCH,
-          },
-        }
-      : {}),
-  };
-}
-
+/**
+ * Runs one spoken question: read it aloud, then listen for the answer.
+ *
+ * The microphone only opens after the prompt has finished, so the app never
+ * transcribes its own voice. Every round (each question, and each "Listen
+ * again") gets a fresh transcription session, so speech from an earlier round
+ * can never be attributed to the current one.
+ */
 export function useVoiceRound({
+  questionId,
   promptSpoken,
   locked,
   onAnswer,
   onSkip,
   onListeningStart,
 }: UseVoiceRoundArgs): UseVoiceRoundResult {
-  const [phase, setPhase] = useState<VoicePhase>("asking");
-  const [transcript, setTranscript] = useState("");
-  const [statusText, setStatusText] = useState("Speaking…");
+  const apiKey = getGeminiApiKey();
+  const [attempt, setAttempt] = useState(0);
+  const roundKey = `${questionId}#${attempt}`;
 
-  const activeRef = useRef(true);
-  const lockedRef = useRef(locked);
-  const finalizedRef = useRef(false);
-  const fullTranscriptRef = useRef("");
-  const finalizedSpeechRef = useRef("");
-  const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const listeningMarkedRef = useRef(false);
-  const deepgramKey = getDeepgramApiKey();
-  const useDeepgram = deepgramKey != null;
+  // Reset during render when the round changes (new question or Listen again).
+  const [round, setRound] = useState(() => freshRound(roundKey, apiKey != null));
+  if (round.key !== roundKey) {
+    setRound(freshRound(roundKey, apiKey != null));
+  }
 
   const onAnswerRef = useRef(onAnswer);
   const onSkipRef = useRef(onSkip);
   const onListeningStartRef = useRef(onListeningStart);
-
-  const deepgramSessionRef = useRef<ReturnType<typeof createDeepgramLiveSession> | null>(
-    null,
-  );
-  const micStreamRef = useRef<ReturnType<typeof createMicPcmStream> | null>(null);
-
-  useEffect(() => {
-    lockedRef.current = locked;
-  }, [locked]);
+  const audioSinkRef = useRef<((buffer: AudioStreamBuffer) => void) | null>(null);
+  /** Key of the round currently using the microphone. */
+  const micOwnerRef = useRef<string | null>(null);
+  const micPermittedRef = useRef(false);
+  const endRoundRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     onAnswerRef.current = onAnswer;
@@ -120,297 +102,176 @@ export function useVoiceRound({
     onListeningStartRef.current = onListeningStart;
   }, [onListeningStart]);
 
+  const { stream } = useAudioStream({
+    sampleRate: SAMPLE_RATE,
+    channels: 1,
+    encoding: "int16",
+    onBuffer: (buffer) => audioSinkRef.current?.(buffer),
+  });
+
+
   useEffect(() => {
-    activeRef.current = true;
-    return () => {
-      activeRef.current = false;
+    if (!apiKey || locked) {
+      return;
+    }
+
+    const key = roundKey;
+    let ended = false;
+    let failed = false;
+    let listeningRequested = false;
+    let listener: AnswerListener | null = null;
+
+    const update = (patch: Partial<Omit<RoundState, "key">>) => {
+      if (!ended) {
+        setRound((prev) => (prev.key === key ? { ...prev, ...patch } : prev));
+      }
     };
-  }, []);
 
-  const clearSettleTimer = useCallback(() => {
-    if (settleTimer.current) {
-      clearTimeout(settleTimer.current);
-      settleTimer.current = null;
-    }
-  }, []);
+    const stopStream = () => {
+      try {
+        stream.stop();
+      } catch {
+        // Already released on unmount.
+      }
+    };
 
-  const markListening = useCallback(() => {
-    if (!listeningMarkedRef.current) {
-      listeningMarkedRef.current = true;
-      onListeningStartRef.current();
-    }
-    setPhase("listening");
-    setStatusText("Speak anytime…");
-  }, []);
+    const releaseMic = () => {
+      if (micOwnerRef.current === key) {
+        micOwnerRef.current = null;
+        audioSinkRef.current = null;
+        stopStream();
+      }
+    };
 
-  const bargeInStopTts = useCallback(() => {
-    Speech.stop();
-  }, []);
+    const fail = (phase: VoicePhase, message: string) => {
+      failed = true;
+      releaseMic();
+      listener?.dispose();
+      update({ phase, statusText: message });
+    };
 
-  const stopStreams = useCallback(() => {
-    clearSettleTimer();
-    micStreamRef.current?.stop();
-    micStreamRef.current = null;
-    deepgramSessionRef.current?.stop();
-    deepgramSessionRef.current = null;
-    stopDeviceRecognition();
-  }, [clearSettleTimer]);
+    const roundListener = createAnswerListener(
+      (handlers) => openGeminiTranscriber(apiKey, handlers),
+      {
+        onTranscript: (text) => update({ transcript: text }),
+        onReprompt: (reason) =>
+          update({
+            phase: "prompt_again",
+            statusText: reason === "ambiguous" ? "Say just one number" : "Say a number, or say “skip”",
+          }),
+        onSubmit: (result) => {
+          if (ended) {
+            return;
+          }
+          releaseMic();
+          if (result.kind === "answer") {
+            update({ phase: "processing", transcript: String(result.value), statusText: "Got it" });
+            onAnswerRef.current(result.value);
+          } else {
+            update({ phase: "processing", statusText: "Skipped" });
+            onSkipRef.current();
+          }
+        },
+        onError: (message) => {
+          if (!ended) {
+            fail("unavailable", message);
+          }
+        },
+      },
+    );
+    listener = roundListener;
 
-  const stopAll = useCallback(() => {
-    Speech.stop();
-    stopStreams();
-  }, [stopStreams]);
+    let promptTimer: ReturnType<typeof setTimeout> | undefined;
 
-  const applyParseResult = useCallback(
-    (parsed: ParseResult) => {
-      if (!activeRef.current || lockedRef.current || finalizedRef.current) {
+    const startListening = async () => {
+      clearTimeout(promptTimer);
+      if (ended || failed || listeningRequested) {
         return;
       }
-      if (parsed.kind === "answer") {
-        finalizedRef.current = true;
-        stopStreams();
-        setPhase("processing");
-        setStatusText(`Heard: ${parsed.value}`);
-        onAnswerRef.current(parsed.value);
-        return;
-      }
-      if (parsed.kind === "skip") {
-        finalizedRef.current = true;
-        stopStreams();
-        setPhase("processing");
-        setStatusText("Skipped");
-        onSkipRef.current();
-        return;
-      }
-      if (parsed.kind === "unknown") {
-        stopStreams();
-        setPhase("prompt_again");
-        setStatusText("Say a number or tap Skip");
-        return;
-      }
-    },
-    [stopStreams],
-  );
-
-  const processTranscript = useCallback(
-    async (text: string, isFinal: boolean) => {
-      if (!activeRef.current || lockedRef.current || finalizedRef.current) {
-        return;
-      }
-
-      const piece = text.trim();
-      if (!piece) {
-        return;
-      }
-
-      const merged = isFinal
-        ? finalizedSpeechRef.current
-          ? `${finalizedSpeechRef.current} ${piece}`.trim()
-          : piece
-        : finalizedSpeechRef.current
-          ? `${finalizedSpeechRef.current} ${piece}`.trim()
-          : piece;
-
-      if (isFinal) {
-        finalizedSpeechRef.current = merged;
-      }
-
-      fullTranscriptRef.current = merged;
-      setTranscript(merged);
-
-      const interpreted = interpretAnswerDeterministic(merged);
-      if (
-        interpreted.confidence === "high" &&
-        (interpreted.kind === "answer" || interpreted.kind === "skip")
-      ) {
-        applyParseResult(interpreted);
-        return;
-      }
-
-      if (isFinal || isConfidentInterim(merged, interpreted)) {
-        if (interpreted.kind === "answer" || interpreted.kind === "skip") {
-          applyParseResult(interpreted);
+      listeningRequested = true;
+      if (!micPermittedRef.current) {
+        const permission = await requestRecordingPermissionsAsync().catch(() => null);
+        if (ended || failed) {
           return;
         }
+        if (!permission?.granted) {
+          fail("denied", "Microphone permission required");
+          return;
+        }
+        micPermittedRef.current = true;
       }
 
-      clearSettleTimer();
-      settleTimer.current = setTimeout(() => {
-        void (async () => {
-          if (!activeRef.current || finalizedRef.current || lockedRef.current) {
-            return;
-          }
-          const latest = fullTranscriptRef.current;
-          const det = interpretAnswerDeterministic(latest);
-          if (det.kind === "answer" || det.kind === "skip") {
-            applyParseResult(det);
-            return;
-          }
-          const openAiKey = getOpenAiApiKey();
-          if (openAiKey && needsLlmFallback(latest, det)) {
-            setStatusText("Thinking…");
-            const llm = await interpretAnswerWithLlm(latest, openAiKey);
-            if (llm.kind === "answer" || llm.kind === "skip") {
-              applyParseResult(llm);
-              return;
-            }
-          }
-          stopStreams();
-          setPhase("prompt_again");
-          setStatusText("Tap Listen again and say your answer");
-        })();
-      }, SETTLE_MS);
-    },
-    [applyParseResult, clearSettleTimer, stopStreams],
-  );
+      micOwnerRef.current = key;
+      audioSinkRef.current = (buffer) => roundListener.pushAudio(buffer.data, buffer.sampleRate);
+      try {
+        await stream.start();
+      } catch (error) {
+        if (micOwnerRef.current === key) {
+          micOwnerRef.current = null;
+          audioSinkRef.current = null;
+        }
+        // Permission may have been revoked in Settings; ask again next time.
+        micPermittedRef.current = false;
+        if (!ended) {
+          fail("unavailable", error instanceof Error ? error.message : "Microphone unavailable");
+        }
+        return;
+      }
 
-  const startDeepgramListening = useCallback(async () => {
-    if (!deepgramKey) {
-      return;
-    }
-    stopStreams();
-    listeningMarkedRef.current = false;
-    setPhase("listening");
-    setStatusText("Connecting…");
+      if (ended || failed) {
+        // The round ended while the mic was starting; stop it unless a newer round took it over.
+        if (micOwnerRef.current === null || micOwnerRef.current === key) {
+          micOwnerRef.current = null;
+          audioSinkRef.current = null;
+          stopStream();
+        }
+        return;
+      }
+      update({ phase: "listening", statusText: "Listening…" });
+      onListeningStartRef.current();
+    };
 
-    const session = createDeepgramLiveSession({
-      apiKey: deepgramKey,
-      onSpeechStarted: () => {
-        bargeInStopTts();
-        markListening();
-      },
-      onTranscript: ({ transcript: piece, isFinal }) => {
-        bargeInStopTts();
-        markListening();
-        void processTranscript(piece, isFinal);
-      },
-      onError: (msg) => {
-        setPhase("prompt_again");
-        setStatusText(msg);
-      },
-    });
-
-    const mic = createMicPcmStream((data) => {
-      session.sendAudio(data);
-    });
-
-    deepgramSessionRef.current = session;
-    micStreamRef.current = mic;
-
-    try {
-      await session.start();
-      await mic.start();
-      markListening();
-    } catch {
-      stopStreams();
-      setPhase("unavailable");
-      setStatusText(
-        "Deepgram mic failed — rebuild dev APK with expo-audio or check key",
-      );
-    }
-  }, [
-    bargeInStopTts,
-    deepgramKey,
-    markListening,
-    processTranscript,
-    stopStreams,
-  ]);
-
-  const startDeviceListening = useCallback(async () => {
-    if (!ExpoSpeechRecognitionModule.isRecognitionAvailable()) {
-      setPhase("unavailable");
-      setStatusText("Speech recognition not available");
-      return;
-    }
-    const permission = await ExpoSpeechRecognitionModule.requestPermissionsAsync();
-    if (!permission.granted) {
-      setPhase("denied");
-      setStatusText("Microphone / speech permission required");
-      return;
-    }
-    listeningMarkedRef.current = false;
-    stopDeviceRecognition();
-    ExpoSpeechRecognitionModule.start(buildDeviceStartOptions());
-    markListening();
-  }, [markListening]);
-
-  const startListening = useCallback(async () => {
-    if (lockedRef.current || finalizedRef.current) {
-      return;
-    }
-    fullTranscriptRef.current = "";
-    finalizedSpeechRef.current = "";
-    setTranscript("");
-    if (useDeepgram) {
-      await startDeepgramListening();
-    } else {
-      await startDeviceListening();
-    }
-  }, [startDeepgramListening, startDeviceListening, useDeepgram]);
-
-  const listenAgain = useCallback(() => {
-    if (lockedRef.current || finalizedRef.current) {
-      return;
-    }
+    promptTimer = setTimeout(() => void startListening(), promptTimeoutMs(promptSpoken));
     Speech.stop();
-    void startListening();
-  }, [startListening]);
-
-  useSpeechRecognitionEvent("result", (event) => {
-    if (useDeepgram || !activeRef.current || finalizedRef.current || lockedRef.current) {
-      return;
-    }
-    const piece = event.results[0]?.transcript?.trim() ?? "";
-    if (!piece) {
-      return;
-    }
-    bargeInStopTts();
-    markListening();
-    void processTranscript(piece, event.isFinal);
-  });
-
-  useSpeechRecognitionEvent("error", (event) => {
-    if (useDeepgram || finalizedRef.current || event.error === "aborted") {
-      return;
-    }
-    if (event.error === "not-allowed") {
-      setPhase("denied");
-      setStatusText("Microphone / speech permission required");
-    }
-  });
-
-  useEffect(() => {
-    const listenTimer = setTimeout(() => {
-      void startListening();
-    }, 0);
-
     Speech.speak(promptSpoken, {
       language: "en-US",
       rate: 1.0,
-      onDone: () => {
-        if (!finalizedRef.current && activeRef.current) {
-          setStatusText("Speak anytime…");
-        }
-      },
+      // iOS: speak through the system's own session; the mic stream switches the
+      // app session to record-only, which would otherwise silence later prompts.
+      useApplicationAudioSession: false,
+      onDone: () => void startListening(),
+      onError: () => void startListening(),
     });
 
-    return () => {
-      clearTimeout(listenTimer);
-      stopAll();
+    const end = () => {
+      if (ended) {
+        return;
+      }
+      ended = true;
+      clearTimeout(promptTimer);
+      Speech.stop();
+      releaseMic();
+      roundListener.dispose();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- one round per mount
+    endRoundRef.current = end;
+    return end;
+  }, [apiKey, locked, roundKey, promptSpoken, stream]);
+
+  const listenAgain = useCallback(() => {
+    if (!locked) {
+      setAttempt((n) => n + 1);
+    }
+  }, [locked]);
+
+  const stopAll = useCallback(() => {
+    endRoundRef.current?.();
+    Speech.stop();
   }, []);
 
-  useEffect(() => {
-    if (locked) {
-      stopAll();
-    }
-  }, [locked, stopAll]);
-
   return {
-    phase,
-    transcript,
-    statusText,
+    phase: round.phase,
+    transcript: round.transcript,
+    statusText: round.statusText,
     listenAgain,
     stopAll,
   };

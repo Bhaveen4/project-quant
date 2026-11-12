@@ -36,12 +36,7 @@ export default function PracticeScreen() {
 
   if (session.settings.inputMode === "voice") {
     return (
-      <VoicePracticeRound
-        key={question.id}
-        session={session}
-        question={question}
-        replace={replace}
-      />
+      <VoicePracticeRound session={session} question={question} replace={replace} />
     );
   }
 
@@ -66,13 +61,25 @@ function useRoundCommit(
   const missTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingSession = useRef<PracticeSession | null>(null);
 
+  // Voice rounds reuse one component instance across questions (no `key` remount),
+  // so round state is reset during render instead of in an effect.
+  const [lastQuestionId, setLastQuestionId] = useState(question.id);
+  if (lastQuestionId !== question.id) {
+    setLastQuestionId(question.id);
+    setInputLocked(false);
+    setMissFlash(false);
+  }
+
   useEffect(() => {
+    startedAt.current = 0;
+    pendingSession.current = null;
     return () => {
       if (missTimer.current) {
         clearTimeout(missTimer.current);
+        missTimer.current = null;
       }
     };
-  }, []);
+  }, [question.id]);
 
   const markStart = () => {
     if (startedAt.current === 0) {
@@ -273,9 +280,7 @@ function VoicePracticeRound({
   const display =
     voice.transcript.trim().length > 0
       ? voice.transcript
-      : missFlash
-        ? " "
-        : " ";
+      : " ";
 
   return (
     <PracticeChrome
@@ -304,16 +309,19 @@ function VoicePracticeRound({
               <Text style={styles.voiceBtnLabel}>Listen again</Text>
             </Pressable>
           </View>
-          {voice.phase === "denied" || voice.phase === "unavailable" ? (
+          {voice.phase === "denied" ? (
             <Text style={styles.hint}>
-              Voice needs a development build with microphone permission. Use Typed mode
-              from Setup if this keeps failing.
+              Allow microphone access for this app in system settings, then tap Listen again.
+            </Text>
+          ) : voice.phase === "unavailable" ? (
+            <Text style={styles.hint}>
+              Voice needs a Gemini Live connection. Check EXPO_PUBLIC_GEMINI_API_KEY and your
+              network, then tap Listen again — or use Typed mode from Setup.
             </Text>
           ) : (
             <Text style={styles.hint}>
-              Speak anytime — you can answer while the question is still being read. Live
-              text appears above. Tap Listen again if it stops. Set EXPO_PUBLIC_DEEPGRAM_API_KEY
-              in apps/mobile/.env for cloud STT.
+              The mic opens after the question is spoken. Say your answer naturally —
+              corrections like “50 oops 60” are understood. Say “skip” to pass.
             </Text>
           )}
         </View>

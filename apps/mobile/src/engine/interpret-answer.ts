@@ -1,63 +1,31 @@
-import { parseAnswer, type ParseResult } from "./parse-answer";
+import { endsMidAnswer, parseAnswer } from "./parse-answer";
 
-export type InterpretConfidence = "high" | "low";
+export type SubmittedAnswer = { kind: "answer"; value: number } | { kind: "skip" };
 
-export type InterpretResult = ParseResult & {
-  confidence: InterpretConfidence;
-};
+export type UtteranceDecision =
+  /** A complete answer or skip: submit it now. */
+  | { action: "submit"; result: SubmittedAnswer }
+  /** Sounds unfinished ("twenty…", "fifty, oops…"): submit `value` only if nothing follows. */
+  | { action: "wait"; value: number }
+  /** No usable answer ("I don't know", "15 or 16"): ask the user again. */
+  | { action: "reprompt"; reason: "unknown" | "ambiguous" }
+  /** Nothing to act on yet (filler, thinking aloud, question echo). */
+  | { action: "none" };
 
-function tokenCount(transcript: string): number {
-  return transcript.trim().split(/\s+/).filter(Boolean).length;
-}
-
-/**
- * Whether we can commit from a partial transcript without waiting for LLM / final.
- */
-export function isConfidentInterim(
-  transcript: string,
-  parsed: ParseResult,
-): boolean {
-  if (parsed.kind === "skip" || parsed.kind === "unknown") {
-    return true;
-  }
-  if (parsed.kind !== "answer") {
-    return false;
-  }
-
-  const trimmed = transcript.trim();
-  if (/^\d{1,4}$/.test(trimmed)) {
-    return true;
-  }
-
-  const words = tokenCount(trimmed);
-  if (words <= 2) {
-    return true;
-  }
-
-  if (/\b(is|equals|that's|thats|oops|sorry|no|wait)\b/i.test(trimmed)) {
-    return true;
-  }
-
-  return words <= 4;
-}
-
-export function interpretAnswerDeterministic(
-  transcript: string,
-): InterpretResult {
+/** Decide what to do with everything the user has said so far this round. */
+export function interpretUtterance(transcript: string): UtteranceDecision {
   const parsed = parseAnswer(transcript);
-  const confidence = isConfidentInterim(transcript, parsed) ? "high" : "low";
-  return { ...parsed, confidence };
-}
-
-export function needsLlmFallback(
-  transcript: string,
-  parsed: ParseResult,
-): boolean {
-  if (!transcript.trim()) {
-    return false;
+  switch (parsed.kind) {
+    case "skip":
+      return { action: "submit", result: parsed };
+    case "answer":
+      return endsMidAnswer(transcript)
+        ? { action: "wait", value: parsed.value }
+        : { action: "submit", result: parsed };
+    case "unknown":
+    case "ambiguous":
+      return { action: "reprompt", reason: parsed.kind };
+    case "unparsed":
+      return { action: "none" };
   }
-  if (parsed.kind === "answer" || parsed.kind === "skip" || parsed.kind === "unknown") {
-    return false;
-  }
-  return tokenCount(transcript) >= 6 || parsed.kind === "ambiguous";
 }
