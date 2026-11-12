@@ -11,7 +11,6 @@
       "icon": "./assets/expo.icon",
       "bundleIdentifier": "com.bhaveen.projectquant",
       "infoPlist": {
-        "NSSpeechRecognitionUsageDescription": "Allow Project Quant to hear your spoken answers.",
         "NSMicrophoneUsageDescription": "Allow Project Quant to use the microphone for voice answers."
       }
     },
@@ -41,18 +40,6 @@
           "backgroundColor": "#208AEF",
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
-        }
-      ],
-      [
-        "expo-speech-recognition",
-        {
-          "microphonePermission": "Allow Project Quant to use the microphone for voice answers.",
-          "speechRecognitionPermission": "Allow Project Quant to hear your spoken answers.",
-          "androidSpeechServicePackages": [
-            "com.google.android.googlequicksearchbox",
-            "com.google.android.tts",
-            "com.google.android.as"
-          ]
         }
       ]
     ],
